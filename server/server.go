@@ -274,22 +274,12 @@ func ExecuteFunction(server *Server, client Client, msg Message) {
     if executer.Role != "client" { server.Write(&client, -1, client.Id, []byte("не клиент не может выполнять команды"), true); return }
 
     server.Write(&executer, client.Id, executer.Id, []byte(cmd), true)
+}
 
-    for {
-        msg_exec, err := server.Read(&executer)
-        if err != nil { log.Print(err, 17) }
-
-        err = server.Write(&client, executer.Id, client.Id, msg.Message, msg_exec.End)
-        if err != nil { log.Print(err, 18) }
-
-        msg, err = server.Read(&client)
-        if err != nil { log.Print(19) }
-        
-        err = server.Write(&executer, executer.Id, client.Id, msg.Message, msg.End)
-        if err != nil { log.Print(20) }
-
-        if msg_exec.End { break }
-    }
+func ExecutionFunction(server *Server, client Client, msg Message) {
+    receiver, ok := server.GetClient(msg.Receiver)
+    if !ok { log.Print("ID получателя не найдено") }
+    server.Write(&client, client.Id, receiver.Id, []byte(msg.Message), msg.End)
 }
 
 func main() {
@@ -299,6 +289,7 @@ func main() {
     Commands["#!help"]       = nil
     Commands["#!list_users"] = ListUsersFunction
     Commands["#!execute"]    = ExecuteFunction
+    Commands["#!execution"]  = ExecutionFunction
     
     server := NewServer()
     

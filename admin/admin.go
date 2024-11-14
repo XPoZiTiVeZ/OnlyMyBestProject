@@ -66,7 +66,6 @@ func Serialize(data []byte) (message Message, err error) {
     err = json.Unmarshal(data, &message)
     return
 }
-
 type Client struct {
     Id           int	`json:"Id"`
     SecretKey    string `json:"SecretKey"`
@@ -187,8 +186,6 @@ func ExecuteFunction(client *Client, cmd string) {
     cmdparts := strings.Split(cmd, " ")
     if len(cmdparts) < 4 { log.Print("слишком короткая команда"); return }
 
-    log.Print(123)
-
     var receiverID int
     if n, _ := fmt.Sscan(cmdparts[1], &receiverID); n == 0 { log.Print("ID не число"); return }
 
@@ -223,7 +220,7 @@ func ExecuteFunction(client *Client, cmd string) {
         writeEnd = true
     }()
 
-    oswriter.Write([]byte("Напишите stop, чтобы остановить\n>>> "))
+    oswriter.Write([]byte("Напишите stop, чтобы остановить\n> "))
     oswriter.Flush()
 
     data := make([]byte, 65536)
@@ -234,7 +231,8 @@ func ExecuteFunction(client *Client, cmd string) {
     }
 
     for !writeEnd { time.Sleep(time.Second) }
-    log.Print(123)
+    oswriter.Write([]byte("\n> executed"))
+    oswriter.Flush()
 }
 
 func (client *Client) Read() (Message, error) {

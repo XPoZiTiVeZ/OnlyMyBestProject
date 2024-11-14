@@ -21,7 +21,15 @@ import (
 	"github.com/coder/websocket"
 )
 
-var PingError error
+type Execution struct {
+	stdin  io.WriteCloser
+	stdout io.ReadCloser
+	stderr io.ReadCloser
+}
+
+// var id           int
+var Commands     map[int]Execution
+var PingError    error
 var ReceiveError error
 
 type Message struct {
@@ -118,48 +126,61 @@ func (client *Client) Ping() {
 	}
 }
 
-func Execute(command string) (*exec.Cmd, io.ReadCloser, error) {
-	command_args := strings.Split(command, " ")
-	cmd := exec.Command(command_args[0], command_args[1:]...)
+func Execute(command, os string) (*exec.Cmd, Execution, error) {
+	var cmd *exec.Cmd
+	if os == "windows" {
+		cmd = exec.Command("cmd", "/c", command)
+	} else {
+		cmd = exec.Command("bash", "-c", command)
+	}
+	
+	stdin,  err := cmd.StdinPipe()
+	if err != nil { return cmd, Execution{}, err }
 
 	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return cmd, stdout, err
-	}
+	if err != nil { return cmd, Execution{}, err }
 
-	if err := cmd.Start(); err != nil {
-		return cmd, stdout, err
-	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil { return cmd, Execution{}, err }
+
+	if err := cmd.Start(); err != nil { return cmd, Execution{}, err }
+
+	return cmd, Execution{stdin, stdout, stderr}, nil
 
 	// if err := cmd.Wait(); err != nil {
 	// 	return stdout, err
 	// }
-	
-	return cmd, stdout, nil
-	
 }
 
 func (client *Client) Receive() {
 	for {
-		if PingError != nil { return }
-		msg, err := client.Read()
-		if err != nil { log.Print(12) }
-
-		log.Print(msg, string(msg.Message))
-
-		cmd, stdout, err := Execute(string(msg.Message))
-		if err != nil { client.Write(client.Id, msg.Sender, []byte(err.Error()), true) }
-		
-		scanner := bufio.NewScanner(stdout)
-		for scanner.Scan() {
-			err := client.Write(client.Id, msg.Sender, scanner.Bytes(), false)
-			if err != nil { log.Print(err, 123)}
+		go func() {
+			if PingError != nil { return }
 
 			msg, err := client.Read()
-			if err != nil { log.Print(321) }
+			if PingError != nil { return }
+			if err != nil { log.Print(err, 12) }
 
-			if string(msg.Message) != "ok" { cmd.Cancel(); break }
-		}
+			log.Print(msg, string(msg.Message))
+	
+			cmd, execution, err := Execute(string(msg.Message), client.OS)
+			if err != nil { client.Write(client.Id, msg.Sender, []byte(err.Error()), true) }
+			
+			scanner := bufio.NewScanner(execution.stdout)
+			for scanner.Scan() {
+				err := client.Write(client.Id, msg.Sender, append([]byte("#!execution "), scanner.Bytes()...), false)
+				if err != nil { log.Print(err, 123)}
+	
+				msg, err := client.Read()
+				if err != nil { log.Print(err, 321) }
+	
+				if string(msg.Message) != "ok" { cmd.Cancel(); break }
+			}
+			err = client.Write(client.Id, msg.Sender, []byte("#!execution end"), true)
+			if err != nil { log.Print(err, 123)}
+
+			defer cmd.Wait()
+		}()
 	}
 }
 
