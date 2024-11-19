@@ -283,10 +283,10 @@ func ExecutionFunction(server *Server, client Client, msg Message) {
 }
 
 func main() {
-    if len(os.Args) < 2 { log.Print("USAGE ERROR\nUSAGE:\n./server <file_name>", 10) }
+    if len(os.Args) < 2 { fmt.Println("USAGE ERROR\nUSAGE:\n./server <file_name>"); return }
     
     Commands = map[string]func(*Server, Client, Message){}
-    Commands["#!help"]       = nil
+    Commands["#!support"]       = nil
     Commands["#!list_users"] = ListUsersFunction
     Commands["#!execute"]    = ExecuteFunction
     Commands["#!execution"]  = ExecutionFunction

